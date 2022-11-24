@@ -1,6 +1,5 @@
 // Copyright (c) 2010 Satoshi Nakamoto
-// Copyright (c) 2009-2020 The Bitcoin Core developers
-// Copyright (c) 2019 The Unobtanium Core developers
+// Copyright (c) 2009-2014 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -14,7 +13,7 @@
 #include "util.h"
 #include "utilstrencodings.h"
 #ifdef ENABLE_WALLET
-#include "wallet/wallet.h"
+#include "wallet.h"
 #endif
 
 #include <boost/algorithm/string.hpp>
@@ -28,10 +27,10 @@
 #include <boost/shared_ptr.hpp>
 #include <boost/signals2/signal.hpp>
 #include <boost/thread.hpp>
-
-#include "univalue/univalue.h"
+#include "json/json_spirit_writer_template.h"
 
 using namespace boost::asio;
+using namespace json_spirit;
 using namespace RPCServer;
 using namespace std;
 
@@ -43,7 +42,7 @@ static std::string rpcWarmupStatus("RPC server started");
 static CCriticalSection cs_rpcWarmup;
 
 //! These are created by StartRPCThreads, destroyed in StopRPCThreads
-static ioContext* rpc_io_service = NULL;
+static boost::asio::io_service* rpc_io_service = NULL;
 static map<string, boost::shared_ptr<deadline_timer> > deadlineTimers;
 static ssl::context* rpc_ssl_context = NULL;
 static boost::thread_group* rpc_worker_group = NULL;
@@ -79,41 +78,41 @@ void RPCServer::OnPostCommand(boost::function<void (const CRPCCommand&)> slot)
     g_rpcSignals.PostCommand.connect(boost::bind(slot, _1));
 }
 
-void RPCTypeCheck(const UniValue& params,
-                  const list<UniValue::VType>& typesExpected,
+void RPCTypeCheck(const Array& params,
+                  const list<Value_type>& typesExpected,
                   bool fAllowNull)
 {
     unsigned int i = 0;
-    BOOST_FOREACH(UniValue::VType t, typesExpected)
+    BOOST_FOREACH(Value_type t, typesExpected)
     {
         if (params.size() <= i)
             break;
 
-        const UniValue& v = params[i];
-        if (!((v.type() == t) || (fAllowNull && (v.isNull()))))
+        const Value& v = params[i];
+        if (!((v.type() == t) || (fAllowNull && (v.type() == null_type))))
         {
             string err = strprintf("Expected type %s, got %s",
-                                   uvTypeName(t), uvTypeName(v.type()));
+                                   Value_type_name[t], Value_type_name[v.type()]);
             throw JSONRPCError(RPC_TYPE_ERROR, err);
         }
         i++;
     }
 }
 
-void RPCTypeCheckObj(const UniValue& o,
-                  const map<string, UniValue::VType>& typesExpected,
+void RPCTypeCheck(const Object& o,
+                  const map<string, Value_type>& typesExpected,
                   bool fAllowNull)
 {
-    BOOST_FOREACH(const PAIRTYPE(string, UniValue::VType)& t, typesExpected)
+    BOOST_FOREACH(const PAIRTYPE(string, Value_type)& t, typesExpected)
     {
-        const UniValue& v = find_value(o, t.first);
-        if (!fAllowNull && v.isNull())
+        const Value& v = find_value(o, t.first);
+        if (!fAllowNull && v.type() == null_type)
             throw JSONRPCError(RPC_TYPE_ERROR, strprintf("Missing %s", t.first));
 
-        if (!((v.type() == t.second) || (fAllowNull && (v.isNull()))))
+        if (!((v.type() == t.second) || (fAllowNull && (v.type() == null_type))))
         {
             string err = strprintf("Expected type %s for %s, got %s",
-                                   uvTypeName(t.second), t.first, uvTypeName(v.type()));
+                                   Value_type_name[t.second], t.first, Value_type_name[v.type()]);
             throw JSONRPCError(RPC_TYPE_ERROR, err);
         }
     }
@@ -124,10 +123,10 @@ static inline int64_t roundint64(double d)
     return (int64_t)(d > 0 ? d + 0.5 : d - 0.5);
 }
 
-CAmount AmountFromValue(const UniValue& value)
+CAmount AmountFromValue(const Value& value)
 {
     double dAmount = value.get_real();
-    if (dAmount <= 0.0 || dAmount > 250000.0)
+    if (dAmount <= 0.0 || dAmount > 21000000.0)
         throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount");
     CAmount nAmount = roundint64(dAmount * COIN);
     if (!MoneyRange(nAmount))
@@ -135,15 +134,15 @@ CAmount AmountFromValue(const UniValue& value)
     return nAmount;
 }
 
-UniValue ValueFromAmount(const CAmount& amount)
+Value ValueFromAmount(const CAmount& amount)
 {
     return (double)amount / (double)COIN;
 }
 
-uint256 ParseHashV(const UniValue& v, string strName)
+uint256 ParseHashV(const Value& v, string strName)
 {
     string strHex;
-    if (v.isStr())
+    if (v.type() == str_type)
         strHex = v.get_str();
     if (!IsHex(strHex)) // Note: IsHex("") is false
         throw JSONRPCError(RPC_INVALID_PARAMETER, strName+" must be hexadecimal string (not '"+strHex+"')");
@@ -151,20 +150,20 @@ uint256 ParseHashV(const UniValue& v, string strName)
     result.SetHex(strHex);
     return result;
 }
-uint256 ParseHashO(const UniValue& o, string strKey)
+uint256 ParseHashO(const Object& o, string strKey)
 {
     return ParseHashV(find_value(o, strKey), strKey);
 }
-vector<unsigned char> ParseHexV(const UniValue& v, string strName)
+vector<unsigned char> ParseHexV(const Value& v, string strName)
 {
     string strHex;
-    if (v.isStr())
+    if (v.type() == str_type)
         strHex = v.get_str();
     if (!IsHex(strHex))
         throw JSONRPCError(RPC_INVALID_PARAMETER, strName+" must be hexadecimal string (not '"+strHex+"')");
     return ParseHex(strHex);
 }
-vector<unsigned char> ParseHexO(const UniValue& o, string strKey)
+vector<unsigned char> ParseHexO(const Object& o, string strKey)
 {
     return ParseHexV(find_value(o, strKey), strKey);
 }
@@ -201,7 +200,7 @@ string CRPCTable::help(string strCommand) const
 
         try
         {
-            UniValue params;
+            Array params;
             rpcfn_type pfn = pcmd->actor;
             if (setDone.insert(pfn).second)
                 (*pfn)(params, true);
@@ -234,7 +233,7 @@ string CRPCTable::help(string strCommand) const
     return strRet;
 }
 
-UniValue help(const UniValue& params, bool fHelp)
+Value help(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() > 1)
         throw runtime_error(
@@ -254,16 +253,16 @@ UniValue help(const UniValue& params, bool fHelp)
 }
 
 
-UniValue stop(const UniValue& params, bool fHelp)
+Value stop(const Array& params, bool fHelp)
 {
     // Accept the deprecated and ignored 'detach' boolean argument
     if (fHelp || params.size() > 1)
         throw runtime_error(
             "stop\n"
-            "\nStop Unobtanium server.");
+            "\nStop Bitcoin server.");
     // Shutdown will take long enough that the response should get back
     StartShutdown();
-    return "Unobtanium server stopping";
+    return "Bitcoin server stopping";
 }
 
 
@@ -291,7 +290,6 @@ static const CRPCCommand vRPCCommands[] =
     /* Block chain and UTXO */
     { "blockchain",         "getblockchaininfo",      &getblockchaininfo,      true,      false },
     { "blockchain",         "getbestblockhash",       &getbestblockhash,       true,      false },
-    { "blockchain",         "getblockheader",         &getblockheader,         true,      false },
     { "blockchain",         "getblockcount",          &getblockcount,          true,      false },
     { "blockchain",         "getblock",               &getblock,               true,      false },
     { "blockchain",         "getblockhash",           &getblockhash,           true,      false },
@@ -309,9 +307,9 @@ static const CRPCCommand vRPCCommands[] =
     { "mining",             "getnetworkhashps",       &getnetworkhashps,       true,      false },
     { "mining",             "prioritisetransaction",  &prioritisetransaction,  true,      false },
     { "mining",             "submitblock",            &submitblock,            true,      false },
+	{ "mining", 			"getauxblock", 			  &getauxblock, 		   true, 	  false },
     { "mining",             "createauxblock",         &createauxblock,         true,      false },
     { "mining",             "submitauxblock",         &submitauxblock,         true,      false },
-  	{ "mining", 		      	"getauxblock", 			      &getauxblock, 		       true, 	    false },
 
 #ifdef ENABLE_WALLET
     /* Coin generation */
@@ -414,14 +412,14 @@ bool HTTPAuthorized(map<string, string>& mapHeaders)
     return TimingResistantEqual(strUserPass, strRPCUserColonPass);
 }
 
-void ErrorReply(std::ostream& stream, const UniValue& objError, const UniValue& id)
+void ErrorReply(std::ostream& stream, const Object& objError, const Value& id)
 {
     // Send error reply from json-rpc error object
     int nStatus = HTTP_INTERNAL_SERVER_ERROR;
     int code = find_value(objError, "code").get_int();
     if (code == RPC_INVALID_REQUEST) nStatus = HTTP_BAD_REQUEST;
     else if (code == RPC_METHOD_NOT_FOUND) nStatus = HTTP_NOT_FOUND;
-    string strReply = JSONRPCReply(NullUniValue, objError, id);
+    string strReply = JSONRPCReply(Value::null, objError, id);
     stream << HTTPReply(nStatus, strReply, false) << std::flush;
 }
 
@@ -461,10 +459,10 @@ class AcceptedConnectionImpl : public AcceptedConnection
 {
 public:
     AcceptedConnectionImpl(
-            ioContext& io_context,
+            boost::asio::io_service& io_service,
             ssl::context &context,
             bool fUseSSL) :
-        sslStream(io_context, context),
+        sslStream(io_service, context),
         _d(sslStream, fUseSSL),
         _stream(_d)
     {
@@ -496,8 +494,8 @@ private:
 void ServiceConnection(AcceptedConnection *conn);
 
 //! Forward declaration required for RPCListen
-template <typename Protocol>
-static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> > acceptor,
+template <typename Protocol, typename SocketAcceptorService>
+static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol, SocketAcceptorService> > acceptor,
                              ssl::context& context,
                              bool fUseSSL,
                              boost::shared_ptr< AcceptedConnection > conn,
@@ -506,19 +504,18 @@ static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> 
 /**
  * Sets up I/O resources to accept and handle a new connection.
  */
-template <typename Protocol>
-static void RPCListen(boost::shared_ptr< basic_socket_acceptor<Protocol> > acceptor,
+template <typename Protocol, typename SocketAcceptorService>
+static void RPCListen(boost::shared_ptr< basic_socket_acceptor<Protocol, SocketAcceptorService> > acceptor,
                    ssl::context& context,
                    const bool fUseSSL)
 {
     // Accept connection
-
-    boost::shared_ptr< AcceptedConnectionImpl<Protocol> > conn(new AcceptedConnectionImpl<Protocol>(GetIOServiceFromPtr(acceptor), context, fUseSSL));
+    boost::shared_ptr< AcceptedConnectionImpl<Protocol> > conn(new AcceptedConnectionImpl<Protocol>(acceptor->get_io_service(), context, fUseSSL));
 
     acceptor->async_accept(
             conn->sslStream.lowest_layer(),
             conn->peer,
-            boost::bind(&RPCAcceptHandler<Protocol>,
+            boost::bind(&RPCAcceptHandler<Protocol, SocketAcceptorService>,
                 acceptor,
                 boost::ref(context),
                 fUseSSL,
@@ -526,11 +523,12 @@ static void RPCListen(boost::shared_ptr< basic_socket_acceptor<Protocol> > accep
                 _1));
 }
 
+
 /**
  * Accept and handle incoming connection.
  */
-template <typename Protocol>
-static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> > acceptor,
+template <typename Protocol, typename SocketAcceptorService>
+static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol, SocketAcceptorService> > acceptor,
                              ssl::context& context,
                              const bool fUseSSL,
                              boost::shared_ptr< AcceptedConnection > conn,
@@ -605,16 +603,16 @@ void StartRPCThreads()
         unsigned char rand_pwd[32];
         GetRandBytes(rand_pwd, 32);
         uiInterface.ThreadSafeMessageBox(strprintf(
-            _("To use unobtaniumd, or the -server option to unobtanium-qt, you must set an rpcpassword in the configuration file:\n"
+            _("To use bitcoind, or the -server option to bitcoin-qt, you must set an rpcpassword in the configuration file:\n"
               "%s\n"
               "It is recommended you use the following random password:\n"
-              "rpcuser=unobtaniumrpc\n"
+              "rpcuser=bitcoinrpc\n"
               "rpcpassword=%s\n"
               "(you do not need to remember this password)\n"
               "The username and password MUST NOT be the same.\n"
               "If the file does not exist, create it with owner-readable-only file permissions.\n"
               "It is also recommended to set alertnotify so you are notified of problems;\n"
-              "for example: alertnotify=echo %%s | mail -s \"UNO Alert\" admin@foo.com\n"),
+              "for example: alertnotify=echo %%s | mail -s \"Bitcoin Alert\" admin@foo.com\n"),
                 GetConfigFile().string(),
                 EncodeBase58(&rand_pwd[0],&rand_pwd[0]+32)),
                 "", CClientUIInterface::MSG_ERROR | CClientUIInterface::SECURE);
@@ -623,8 +621,8 @@ void StartRPCThreads()
     }
 
     assert(rpc_io_service == NULL);
-    rpc_io_service = new ioContext();
-    rpc_ssl_context = new ssl::context(ssl::context::sslv23);
+    rpc_io_service = new boost::asio::io_service();
+    rpc_ssl_context = new ssl::context(*rpc_io_service, ssl::context::sslv23);
 
     const bool fUseSSL = GetBoolArg("-rpcssl", false);
 
@@ -643,7 +641,7 @@ void StartRPCThreads()
         else LogPrintf("ThreadRPCServer ERROR: missing server private key file %s\n", pathPKFile.string());
 
         string strCiphers = GetArg("-rpcsslciphers", "TLSv1.2+HIGH:TLSv1+HIGH:!SSLv2:!aNULL:!eNULL:!3DES:@STRENGTH");
-        SSL_CTX_set_cipher_list(rpc_ssl_context->native_handle(), strCiphers.c_str());
+        SSL_CTX_set_cipher_list(rpc_ssl_context->impl(), strCiphers.c_str());
     }
 
     std::vector<ip::tcp::endpoint> vEndpoints;
@@ -726,7 +724,7 @@ void StartRPCThreads()
 
     rpc_worker_group = new boost::thread_group();
     for (int i = 0; i < GetArg("-rpcthreads", 4); i++)
-        rpc_worker_group->create_thread(boost::bind(&ioContext::run, rpc_io_service));
+        rpc_worker_group->create_thread(boost::bind(&boost::asio::io_service::run, rpc_io_service));
     fRPCRunning = true;
     g_rpcSignals.Started();
 }
@@ -736,7 +734,7 @@ void StartDummyRPCThread()
     if(rpc_io_service == NULL)
     {
         rpc_io_service = new boost::asio::io_service();
-       /* Create dummy "work" to keep the thread from exiting when no timeouts active,
+        /* Create dummy "work" to keep the thread from exiting when no timeouts active,
          * see http://www.boost.org/doc/libs/1_51_0/doc/html/boost_asio/reference/io_service.html#boost_asio.reference.io_service.stopping_the_io_service_from_running_out_of_work */
         rpc_dummy_work = new boost::asio::io_service::work(*rpc_io_service);
         rpc_worker_group = new boost::thread_group();
@@ -828,76 +826,76 @@ void RPCRunLater(const std::string& name, boost::function<void(void)> func, int6
 class JSONRequest
 {
 public:
-    UniValue id;
+    Value id;
     string strMethod;
-    UniValue params;
+    Array params;
 
-    JSONRequest() { id = NullUniValue; }
-    void parse(const UniValue& valRequest);
+    JSONRequest() { id = Value::null; }
+    void parse(const Value& valRequest);
 };
 
-void JSONRequest::parse(const UniValue& valRequest)
+void JSONRequest::parse(const Value& valRequest)
 {
     // Parse request
-    if (!valRequest.isObject())
+    if (valRequest.type() != obj_type)
         throw JSONRPCError(RPC_INVALID_REQUEST, "Invalid Request object");
-    const UniValue& request = valRequest.get_obj();
+    const Object& request = valRequest.get_obj();
 
     // Parse id now so errors from here on will have the id
     id = find_value(request, "id");
 
     // Parse method
-    UniValue valMethod = find_value(request, "method");
-    if (valMethod.isNull())
+    Value valMethod = find_value(request, "method");
+    if (valMethod.type() == null_type)
         throw JSONRPCError(RPC_INVALID_REQUEST, "Missing method");
-    if (!valMethod.isStr())
+    if (valMethod.type() != str_type)
         throw JSONRPCError(RPC_INVALID_REQUEST, "Method must be a string");
     strMethod = valMethod.get_str();
     if (strMethod != "getblocktemplate")
         LogPrint("rpc", "ThreadRPCServer method=%s\n", SanitizeString(strMethod));
 
     // Parse params
-    UniValue valParams = find_value(request, "params");
-    if (valParams.isArray())
+    Value valParams = find_value(request, "params");
+    if (valParams.type() == array_type)
         params = valParams.get_array();
-    else if (valParams.isNull())
-        params = UniValue(UniValue::VARR);
+    else if (valParams.type() == null_type)
+        params = Array();
     else
         throw JSONRPCError(RPC_INVALID_REQUEST, "Params must be an array");
 }
 
 
-static UniValue JSONRPCExecOne(const UniValue& req)
+static Object JSONRPCExecOne(const Value& req)
 {
-    UniValue rpc_result(UniValue::VOBJ);
+    Object rpc_result;
 
     JSONRequest jreq;
     try {
         jreq.parse(req);
 
-        UniValue result = tableRPC.execute(jreq.strMethod, jreq.params);
-        rpc_result = JSONRPCReplyObj(result, NullUniValue, jreq.id);
+        Value result = tableRPC.execute(jreq.strMethod, jreq.params);
+        rpc_result = JSONRPCReplyObj(result, Value::null, jreq.id);
     }
-    catch (const UniValue& objError)
+    catch (const Object& objError)
     {
-        rpc_result = JSONRPCReplyObj(NullUniValue, objError, jreq.id);
+        rpc_result = JSONRPCReplyObj(Value::null, objError, jreq.id);
     }
     catch (const std::exception& e)
     {
-        rpc_result = JSONRPCReplyObj(NullUniValue,
+        rpc_result = JSONRPCReplyObj(Value::null,
                                      JSONRPCError(RPC_PARSE_ERROR, e.what()), jreq.id);
     }
 
     return rpc_result;
 }
 
-static string JSONRPCExecBatch(const UniValue& vReq)
+static string JSONRPCExecBatch(const Array& vReq)
 {
-    UniValue ret(UniValue::VARR);
+    Array ret;
     for (unsigned int reqIdx = 0; reqIdx < vReq.size(); reqIdx++)
         ret.push_back(JSONRPCExecOne(vReq[reqIdx]));
 
-    return ret.write() + "\n";
+    return write_string(Value(ret), false) + "\n";
 }
 
 static bool HTTPReq_JSONRPC(AcceptedConnection *conn,
@@ -928,8 +926,8 @@ static bool HTTPReq_JSONRPC(AcceptedConnection *conn,
     try
     {
         // Parse request
-        UniValue valRequest;
-        if (!valRequest.read(strRequest))
+        Value valRequest;
+        if (!read_string(strRequest, valRequest))
             throw JSONRPCError(RPC_PARSE_ERROR, "Parse error");
 
         // Return immediately if in warmup
@@ -942,23 +940,23 @@ static bool HTTPReq_JSONRPC(AcceptedConnection *conn,
         string strReply;
 
         // singleton request
-        if (valRequest.isObject()) {
+        if (valRequest.type() == obj_type) {
             jreq.parse(valRequest);
 
-            UniValue result = tableRPC.execute(jreq.strMethod, jreq.params);
+            Value result = tableRPC.execute(jreq.strMethod, jreq.params);
 
             // Send reply
-            strReply = JSONRPCReply(result, NullUniValue, jreq.id);
+            strReply = JSONRPCReply(result, Value::null, jreq.id);
 
         // array of requests
-        } else if (valRequest.isArray())
+        } else if (valRequest.type() == array_type)
             strReply = JSONRPCExecBatch(valRequest.get_array());
         else
             throw JSONRPCError(RPC_PARSE_ERROR, "Top-level object parse error");
 
         conn->stream() << HTTPReplyHeader(HTTP_OK, fRun, strReply.size()) << strReply << std::flush;
     }
-    catch (const UniValue& objError)
+    catch (const Object& objError)
     {
         ErrorReply(conn->stream(), objError, jreq.id);
         return false;
@@ -1008,7 +1006,7 @@ void ServiceConnection(AcceptedConnection *conn)
     }
 }
 
-UniValue CRPCTable::execute(const std::string &strMethod, const UniValue &params) const
+json_spirit::Value CRPCTable::execute(const std::string &strMethod, const json_spirit::Array &params) const
 {
     // Find method
     const CRPCCommand *pcmd = tableRPC[strMethod];
@@ -1030,19 +1028,8 @@ UniValue CRPCTable::execute(const std::string &strMethod, const UniValue &params
     g_rpcSignals.PostCommand(*pcmd);
 }
 
-std::vector<std::string> CRPCTable::listCommands() const
-{
-    std::vector<std::string> commandList;
-    typedef std::map<std::string, const CRPCCommand*> commandMap;
-
-    std::transform( mapCommands.begin(), mapCommands.end(),
-                   std::back_inserter(commandList),
-                   boost::bind(&commandMap::value_type::first,_1) );
-    return commandList;
-}
-
 std::string HelpExampleCli(string methodname, string args){
-    return "> unobtanium-cli " + methodname + " " + args + "\n";
+    return "> bitcoin-cli " + methodname + " " + args + "\n";
 }
 
 std::string HelpExampleRpc(string methodname, string args){
